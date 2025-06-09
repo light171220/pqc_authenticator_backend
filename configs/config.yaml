@@ -1,0 +1,33 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  mode: "debug"
+  read_timeout: 30s
+  write_timeout: 30s
+
+database:
+  type: "sqlite"
+  path: "./data/authenticator.db"
+  max_connections: 25
+
+security:
+  jwt_secret: "change-this-secret-in-production"
+  encryption_key: "32-byte-encryption-key-change-this!"
+  rate_limit_requests: 100
+  rate_limit_window: "1m"
+
+totp:
+  default_period: 30
+  default_digits: 6
+  key_rotation_interval: "24h"
+  backup_key_retention: "48h"
+
+business:
+  webhook_timeout: "10s"
+  analytics_retention: "90d"
+  max_integrations: 10
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"

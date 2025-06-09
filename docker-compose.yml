@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  pqc-authenticator:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - DATABASE_PATH=/app/data/authenticator.db
+      - JWT_SECRET=your-super-secret-jwt-key-here
+      - ENCRYPTION_KEY=your-32-byte-encryption-key-here!
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  data:
+    driver: local
