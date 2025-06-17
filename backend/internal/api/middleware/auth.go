@@ -1,7 +1,9 @@
 package middleware
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"sync"
@@ -65,7 +67,7 @@ func (rl *RateLimiter) Allow(key string) bool {
 
 var authRateLimiter = NewRateLimiter(10)
 
-func JWTAuth(jwtSecret string) gin.HandlerFunc {
+func JWTAuth(jwtSecret string, db *storage.Database) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		clientIP := c.ClientIP()
 		userAgent := c.GetHeader("User-Agent")
@@ -106,9 +108,29 @@ func JWTAuth(jwtSecret string) gin.HandlerFunc {
 			return
 		}
 
+		tokenHash := sha256.Sum256([]byte(token))
+		session, err := storage.GetSessionByToken(db.DB, hex.EncodeToString(tokenHash[:]))
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, utils.NewErrorResponse(
+				utils.NewAppError("SESSION_NOT_FOUND", "Session not found or expired", 401),
+				utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+
+		if !session.IsActive || session.ExpiresAt.Before(time.Now()) {
+			c.JSON(http.StatusUnauthorized, utils.NewErrorResponse(
+				utils.NewAppError("SESSION_EXPIRED", "Session expired", 401),
+				utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+
+		storage.UpdateSessionActivity(db.DB, session.ID)
+
 		c.Set("user_id", claims.UserID)
 		c.Set("user_email", claims.Email)
-		c.Set("session_id", claims.SessionID)
+		c.Set("session_id", session.ID)
 		c.Set("token_issued_at", time.Unix(claims.IssuedAt, 0))
 		c.Set("client_ip", clientIP)
 		c.Set("user_agent", userAgent)
@@ -150,6 +172,14 @@ func BusinessAPIAuth(db *storage.Database) gin.HandlerFunc {
 		if err != nil || business == nil {
 			c.JSON(http.StatusUnauthorized, utils.NewErrorResponse(
 				utils.NewAppError("INVALID_API_KEY", "Invalid API key", 401),
+				utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+
+		if !business.IsActive {
+			c.JSON(http.StatusUnauthorized, utils.NewErrorResponse(
+				utils.NewAppError("BUSINESS_INACTIVE", "Business account is inactive", 401),
 				utils.GenerateTraceID()))
 			c.Abort()
 			return
@@ -205,9 +235,6 @@ func RequirePermission(permission string) gin.HandlerFunc {
 				utils.GenerateTraceID()))
 			c.Abort()
 			return
-		}
-
-		if permission == "admin" {
 		}
 
 		c.Next()

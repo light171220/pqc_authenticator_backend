@@ -49,7 +49,6 @@ var migrations = []string{
 		key_version INTEGER DEFAULT 1,
 		algorithm TEXT DEFAULT 'dilithium-mode3',
 		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-		CONSTRAINT chk_single_active_key UNIQUE (user_id, is_active),
 		CONSTRAINT chk_key_version CHECK (key_version > 0)
 	);
 	`,
@@ -238,6 +237,7 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_business_users_business_id ON business_users(business_id);
 	CREATE INDEX IF NOT EXISTS idx_business_users_user_id ON business_users(user_id);
 	CREATE INDEX IF NOT EXISTS idx_business_users_active ON business_users(is_active);
+	CREATE INDEX IF NOT EXISTS idx_business_users_external_id ON business_users(business_id, external_user_id);
 	CREATE INDEX IF NOT EXISTS idx_key_rotations_user_id ON key_rotations(user_id);
 	CREATE INDEX IF NOT EXISTS idx_key_rotations_date ON key_rotations(rotation_date);
 	CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);

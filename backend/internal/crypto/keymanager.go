@@ -9,21 +9,12 @@ import (
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
 	"github.com/google/uuid"
+	"pqc-authenticator/internal/storage"
 )
 
 type KeyManager struct {
 	db            *sql.DB
 	encryptionKey string
-}
-
-type UserKeyPair struct {
-	ID         string    `db:"id"`
-	UserID     string    `db:"user_id"`
-	PublicKey  string    `db:"public_key"`
-	PrivateKey string    `db:"private_key"`
-	IsActive   bool      `db:"is_active"`
-	CreatedAt  time.Time `db:"created_at"`
-	ExpiresAt  *time.Time `db:"expires_at"`
 }
 
 func NewKeyManager(db *sql.DB) *KeyManager {
@@ -41,7 +32,7 @@ func NewKeyManagerWithKey(db *sql.DB, encryptionKey string) *KeyManager {
 	}
 }
 
-func (km *KeyManager) CreateUserKeyPair(userID string) (*UserKeyPair, error) {
+func (km *KeyManager) CreateUserKeyPair(userID string) (*storage.UserKeypair, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("user ID cannot be empty")
 	}
@@ -61,13 +52,15 @@ func (km *KeyManager) CreateUserKeyPair(userID string) (*UserKeyPair, error) {
 	}
 	SecureZeroMemory(privateKeyBytes)
 
-	keypair := &UserKeyPair{
+	keypair := &storage.UserKeypair{
 		ID:         uuid.New().String(),
 		UserID:     userID,
 		PublicKey:  publicKeyB64,
 		PrivateKey: encryptedPrivateKey,
 		IsActive:   true,
 		CreatedAt:  time.Now(),
+		KeyVersion: 1,
+		Algorithm:  "dilithium-mode3",
 	}
 
 	tx, err := km.db.Begin()
@@ -76,20 +69,11 @@ func (km *KeyManager) CreateUserKeyPair(userID string) (*UserKeyPair, error) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec(`
-		UPDATE user_keypairs 
-		SET is_active = false 
-		WHERE user_id = ? AND is_active = true`,
-		userID)
-	if err != nil {
+	if err := storage.DeactivateUserKeypairs(km.db, userID); err != nil {
 		return nil, fmt.Errorf("failed to deactivate old keys: %w", err)
 	}
 
-	_, err = tx.Exec(`
-		INSERT INTO user_keypairs (id, user_id, public_key, private_key, is_active, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		keypair.ID, keypair.UserID, keypair.PublicKey, keypair.PrivateKey, keypair.IsActive, keypair.CreatedAt)
-	if err != nil {
+	if err := storage.CreateUserKeypair(km.db, keypair); err != nil {
 		return nil, fmt.Errorf("failed to insert keypair: %w", err)
 	}
 
@@ -100,21 +84,12 @@ func (km *KeyManager) CreateUserKeyPair(userID string) (*UserKeyPair, error) {
 	return keypair, nil
 }
 
-func (km *KeyManager) GetActiveKeyPair(userID string) (*UserKeyPair, error) {
+func (km *KeyManager) GetActiveKeyPair(userID string) (*storage.UserKeypair, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("user ID cannot be empty")
 	}
 
-	keypair := &UserKeyPair{}
-	err := km.db.QueryRow(`
-		SELECT id, user_id, public_key, private_key, is_active, created_at, expires_at
-		FROM user_keypairs 
-		WHERE user_id = ? AND is_active = true
-		ORDER BY created_at DESC LIMIT 1`,
-		userID).Scan(
-		&keypair.ID, &keypair.UserID, &keypair.PublicKey, &keypair.PrivateKey,
-		&keypair.IsActive, &keypair.CreatedAt, &keypair.ExpiresAt)
-
+	keypair, err := storage.GetUserKeypairByUserID(km.db, userID)
 	if err == sql.ErrNoRows {
 		return km.CreateUserKeyPair(userID)
 	}
@@ -205,19 +180,38 @@ func (km *KeyManager) RotateUserKeys(userID string) error {
 		return fmt.Errorf("user ID cannot be empty")
 	}
 
-	_, err := km.CreateUserKeyPair(userID)
+	oldKeypair, err := km.GetActiveKeyPair(userID)
+	if err != nil {
+		return fmt.Errorf("failed to get current keypair: %w", err)
+	}
+
+	newKeypair, err := km.CreateUserKeyPair(userID)
 	if err != nil {
 		return fmt.Errorf("failed to create new keypair: %w", err)
+	}
+
+	rotation := &storage.KeyRotation{
+		ID:           uuid.New().String(),
+		UserID:       userID,
+		OldKeyID:     oldKeypair.ID,
+		NewKeyID:     newKeypair.ID,
+		RotationType: "manual",
+		RotationDate: time.Now(),
+		Status:       "completed",
+		InitiatedBy:  "system",
+	}
+
+	if err := storage.CreateKeyRotation(km.db, rotation); err != nil {
+		return fmt.Errorf("failed to log key rotation: %w", err)
 	}
 
 	return nil
 }
 
 func (km *KeyManager) CleanupExpiredKeys() error {
-	_, err := km.db.Exec(`
-		DELETE FROM user_keypairs 
-		WHERE expires_at IS NOT NULL AND expires_at < ?`,
-		time.Now())
+	cutoffTime := time.Now().Add(-72 * time.Hour)
+	
+	_, err := storage.CleanupOldKeyRotations(km.db, cutoffTime)
 	if err != nil {
 		return fmt.Errorf("failed to cleanup expired keys: %w", err)
 	}
@@ -243,13 +237,57 @@ func (km *KeyManager) DeactivateAllUserKeys(userID string) error {
 		return fmt.Errorf("user ID cannot be empty")
 	}
 
-	_, err := km.db.Exec(`
-		UPDATE user_keypairs 
-		SET is_active = false 
-		WHERE user_id = ?`,
-		userID)
-	if err != nil {
+	if err := storage.DeactivateUserKeypairs(km.db, userID); err != nil {
 		return fmt.Errorf("failed to deactivate keys: %w", err)
+	}
+
+	return nil
+}
+
+func (km *KeyManager) GetKeypairByID(keypairID string) (*storage.UserKeypair, error) {
+	if keypairID == "" {
+		return nil, fmt.Errorf("keypair ID cannot be empty")
+	}
+
+	return storage.GetUserKeypairByID(km.db, keypairID)
+}
+
+func (km *KeyManager) ScheduledRotation(userID string) error {
+	if userID == "" {
+		return fmt.Errorf("user ID cannot be empty")
+	}
+
+	age, err := km.GetKeyAge(userID)
+	if err != nil {
+		return fmt.Errorf("failed to get key age: %w", err)
+	}
+
+	if age > 24*time.Hour {
+		oldKeypair, err := km.GetActiveKeyPair(userID)
+		if err != nil {
+			return fmt.Errorf("failed to get current keypair: %w", err)
+		}
+
+		newKeypair, err := km.CreateUserKeyPair(userID)
+		if err != nil {
+			return fmt.Errorf("failed to create new keypair: %w", err)
+		}
+
+		rotation := &storage.KeyRotation{
+			ID:           uuid.New().String(),
+			UserID:       userID,
+			OldKeyID:     oldKeypair.ID,
+			NewKeyID:     newKeypair.ID,
+			RotationType: "scheduled",
+			RotationDate: time.Now(),
+			CleanupDate:  &[]time.Time{time.Now().Add(72 * time.Hour)}[0],
+			Status:       "completed",
+			InitiatedBy:  "scheduler",
+		}
+
+		if err := storage.CreateKeyRotation(km.db, rotation); err != nil {
+			return fmt.Errorf("failed to log scheduled rotation: %w", err)
+		}
 	}
 
 	return nil

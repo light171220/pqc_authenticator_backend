@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    container_name: pqc-backend
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8443
+      - DATABASE_PATH=/app/data/authenticator.db
+      - JWT_SECRET=your-super-secret-jwt-key-for-development-only-change-in-production
+      - ENCRYPTION_KEY=your-32-byte-encryption-key-for-development-only-change-in-production-please
+      - RATE_LIMIT_REQUESTS=100
+      - LOG_LEVEL=info
+      - SERVER_MODE=release
+    volumes:
+      - backend_data:/app/data
+      - backend_logs:/app/logs
+    ports:
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - pqc-network
+
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+    container_name: pqc-frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8443
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pqc-network
+
+volumes:
+  backend_data:
+    driver: local
+  backend_logs:
+    driver: local
+
+networks:
+  pqc-network:
+    driver: bridge

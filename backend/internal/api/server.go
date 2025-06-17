@@ -31,7 +31,7 @@ func NewServer(db *sql.DB, logger utils.Logger, config *utils.Config) *Server {
 		db:     db,
 		logger: logger,
 		config: config,
-		keyMgr: crypto.NewKeyManager(db),
+		keyMgr: crypto.NewKeyManagerWithKey(db, config.Security.EncryptionKey),
 	}
 }
 
@@ -73,12 +73,12 @@ func (s *Server) Router() *gin.Engine {
 		{
 			auth.POST("/register", s.validateRegistration(), userHandler.Register)
 			auth.POST("/login", s.validateLogin(), userHandler.Login)
-			auth.POST("/logout", middleware.JWTAuth(s.config.Security.JWTSecret), userHandler.Logout)
-			auth.POST("/refresh", middleware.JWTAuth(s.config.Security.JWTSecret), userHandler.RefreshToken)
+			auth.POST("/logout", middleware.JWTAuth(s.config.Security.JWTSecret, &storage.Database{DB: s.db}), userHandler.Logout)
+			auth.POST("/refresh", middleware.JWTAuth(s.config.Security.JWTSecret, &storage.Database{DB: s.db}), userHandler.RefreshToken)
 		}
 
 		protected := v1.Group("/")
-		protected.Use(middleware.JWTAuth(s.config.Security.JWTSecret))
+		protected.Use(middleware.JWTAuth(s.config.Security.JWTSecret, &storage.Database{DB: s.db}))
 		{
 			users := protected.Group("/users")
 			{
@@ -236,7 +236,7 @@ func (s *Server) Stop(ctx context.Context) error {
 
 func (s *Server) requestSizeLimit() gin.HandlerFunc {
 	return gin.HandlerFunc(func(c *gin.Context) {
-		const maxRequestSize = 10 << 20 // 10MB
+		const maxRequestSize = 10 << 20
 		
 		if c.Request.ContentLength > maxRequestSize {
 			c.JSON(http.StatusRequestEntityTooLarge, utils.NewErrorResponse(
@@ -257,74 +257,6 @@ func (s *Server) requestTimeout() gin.HandlerFunc {
 		defer cancel()
 		
 		c.Request = c.Request.WithContext(ctx)
-		c.Next()
-	})
-}
-
-func (s *Server) validateRegistration() gin.HandlerFunc {
-	return gin.HandlerFunc(func(c *gin.Context) {
-		var req struct {
-			Username string `json:"username"`
-			Email    string `json:"email"`
-			Password string `json:"password"`
-		}
-		
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
-				utils.ErrInvalidRequest, utils.GenerateTraceID()))
-			c.Abort()
-			return
-		}
-		
-		if !utils.IsValidUsername(req.Username) {
-			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
-				utils.NewAppError("INVALID_USERNAME", "Invalid username format", 400),
-				utils.GenerateTraceID()))
-			c.Abort()
-			return
-		}
-		
-		if !utils.IsValidEmail(req.Email) {
-			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
-				utils.NewAppError("INVALID_EMAIL", "Invalid email format", 400),
-				utils.GenerateTraceID()))
-			c.Abort()
-			return
-		}
-		
-		if !utils.IsStrongPassword(req.Password) {
-			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
-				utils.NewAppError("WEAK_PASSWORD", "Password does not meet security requirements", 400),
-				utils.GenerateTraceID()))
-			c.Abort()
-			return
-		}
-		
-		c.Next()
-	})
-}
-
-func (s *Server) validateLogin() gin.HandlerFunc {
-	return gin.HandlerFunc(func(c *gin.Context) {
-		var req struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
-				utils.ErrInvalidRequest, utils.GenerateTraceID()))
-			c.Abort()
-			return
-		}
-		
-		if len(req.Username) == 0 || len(req.Password) == 0 {
-			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
-				utils.ErrInvalidCredentials, utils.GenerateTraceID()))
-			c.Abort()
-			return
-		}
-		
 		c.Next()
 	})
 }
@@ -835,4 +767,72 @@ func (s *Server) isValidUUID(value string) bool {
 	}
 	
 	return true
+}
+
+func (s *Server) validateRegistration() gin.HandlerFunc {
+	return gin.HandlerFunc(func(c *gin.Context) {
+		var req struct {
+			Username string `json:"username"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+		
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
+				utils.ErrInvalidRequest, utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+		
+		if !utils.IsValidUsername(req.Username) {
+			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
+				utils.NewAppError("INVALID_USERNAME", "Invalid username format", 400),
+				utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+		
+		if !utils.IsValidEmail(req.Email) {
+			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
+				utils.NewAppError("INVALID_EMAIL", "Invalid email format", 400),
+				utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+		
+		if !utils.IsStrongPassword(req.Password) {
+			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
+				utils.NewAppError("WEAK_PASSWORD", "Password does not meet security requirements", 400),
+				utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+		
+		c.Next()
+	})
+}
+
+func (s *Server) validateLogin() gin.HandlerFunc {
+	return gin.HandlerFunc(func(c *gin.Context) {
+		var req struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
+				utils.ErrInvalidRequest, utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+		
+		if len(req.Username) == 0 || len(req.Password) == 0 {
+			c.JSON(http.StatusBadRequest, utils.NewErrorResponse(
+				utils.ErrInvalidCredentials, utils.GenerateTraceID()))
+			c.Abort()
+			return
+		}
+		
+		c.Next()
+	})
 }

@@ -1,13 +1,16 @@
 package handlers
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"pqc-authenticator/internal/crypto"
 	"pqc-authenticator/internal/storage"
 	"pqc-authenticator/internal/utils"
 )
@@ -16,6 +19,7 @@ type UserHandler struct {
 	db     *sql.DB
 	logger utils.Logger
 	config *utils.Config
+	keyMgr *crypto.KeyManager
 }
 
 func NewUserHandler(db *sql.DB, logger utils.Logger, config *utils.Config) *UserHandler {
@@ -23,6 +27,7 @@ func NewUserHandler(db *sql.DB, logger utils.Logger, config *utils.Config) *User
 		db:     db,
 		logger: logger,
 		config: config,
+		keyMgr: crypto.NewKeyManagerWithKey(db, config.Security.EncryptionKey),
 	}
 }
 
@@ -106,7 +111,20 @@ func (h *UserHandler) Register(c *gin.Context) {
 		PasswordHash: passwordHash,
 		CreatedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
+		IsActive:     true,
+		FailedLoginAttempts: 0,
 	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.logger.Error("Failed to begin transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to create user",
+			"code":  "DATABASE_ERROR",
+		})
+		return
+	}
+	defer tx.Rollback()
 
 	if err := storage.CreateUser(h.db, user); err != nil {
 		h.logger.Error("Failed to create user", "error", err)
@@ -115,6 +133,34 @@ func (h *UserHandler) Register(c *gin.Context) {
 			"code":  "DATABASE_ERROR",
 		})
 		return
+	}
+
+	_, err = h.keyMgr.CreateUserKeyPair(user.ID)
+	if err != nil {
+		h.logger.Error("Failed to create user keypair", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to create user",
+			"code":  "KEYPAIR_CREATION_FAILED",
+		})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.logger.Error("Failed to commit transaction", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to create user",
+			"code":  "DATABASE_ERROR",
+		})
+		return
+	}
+
+	if err := storage.LogAuditEvent(h.db, user.ID, "", "user_registered", map[string]interface{}{
+		"username":   user.Username,
+		"ip_address": c.ClientIP(),
+		"user_agent": c.GetHeader("User-Agent"),
+		"result":     "success",
+	}); err != nil {
+		h.logger.Warn("Failed to log audit event", "error", err)
 	}
 
 	h.logger.Info("User registered", "user_id", user.ID, "username", user.Username)
@@ -148,14 +194,54 @@ func (h *UserHandler) Login(c *gin.Context) {
 		return
 	}
 
+	if !user.IsActive {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Account is disabled",
+			"code":  "ACCOUNT_DISABLED",
+		})
+		return
+	}
+
+	if user.LockedUntil != nil && user.LockedUntil.After(time.Now()) {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Account is temporarily locked",
+			"code":  "ACCOUNT_LOCKED",
+		})
+		return
+	}
+
 	if !utils.VerifyPassword(req.Password, user.PasswordHash) {
+		user.FailedLoginAttempts++
+		if user.FailedLoginAttempts >= h.config.Security.MaxLoginAttempts {
+			lockUntil := time.Now().Add(h.config.Security.LockoutDuration)
+			user.LockedUntil = &lockUntil
+		}
+		user.UpdatedAt = time.Now()
+		storage.UpdateUser(h.db, user)
+
 		h.logger.Warn("Invalid password", "user_id", user.ID)
+		
+		storage.LogAuditEvent(h.db, user.ID, "", "login_failed", map[string]interface{}{
+			"reason":     "invalid_password",
+			"attempts":   user.FailedLoginAttempts,
+			"ip_address": c.ClientIP(),
+			"user_agent": c.GetHeader("User-Agent"),
+			"result":     "failed",
+		})
+
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": "Invalid credentials",
 			"code":  "INVALID_CREDENTIALS",
 		})
 		return
 	}
+
+	user.FailedLoginAttempts = 0
+	user.LockedUntil = nil
+	now := time.Now()
+	user.LastLogin = &now
+	user.UpdatedAt = now
+	storage.UpdateUser(h.db, user)
 
 	token, err := utils.GenerateJWT(user.ID, user.Email, h.config.Security.JWTSecret)
 	if err != nil {
@@ -167,10 +253,29 @@ func (h *UserHandler) Login(c *gin.Context) {
 		return
 	}
 
+	tokenHash := sha256.Sum256([]byte(token))
+	session := &storage.Session{
+		ID:           uuid.New().String(),
+		UserID:       user.ID,
+		TokenHash:    hex.EncodeToString(tokenHash[:]),
+		ExpiresAt:    time.Now().Add(h.config.Security.SessionTimeout),
+		LastActivity: time.Now(),
+		IPAddress:    c.ClientIP(),
+		UserAgent:    c.GetHeader("User-Agent"),
+		IsActive:     true,
+		CreatedAt:    time.Now(),
+	}
+
+	if err := storage.CreateSession(h.db, session); err != nil {
+		h.logger.Warn("Failed to create session", "error", err)
+	}
+
 	if err := storage.LogAuditEvent(h.db, user.ID, "", "user_login", map[string]interface{}{
-		"ip_address":  c.ClientIP(),
-		"user_agent":  c.GetHeader("User-Agent"),
-		"login_time":  time.Now(),
+		"session_id": session.ID,
+		"ip_address": c.ClientIP(),
+		"user_agent": c.GetHeader("User-Agent"),
+		"login_time": time.Now().Unix(),
+		"result":     "success",
 	}); err != nil {
 		h.logger.Warn("Failed to log audit event", "error", err)
 	}
@@ -190,6 +295,8 @@ func (h *UserHandler) Login(c *gin.Context) {
 
 func (h *UserHandler) Logout(c *gin.Context) {
 	userID := c.GetString("user_id")
+	sessionID := c.GetString("session_id")
+	
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": "Authentication required",
@@ -198,10 +305,16 @@ func (h *UserHandler) Logout(c *gin.Context) {
 		return
 	}
 
+	if sessionID != "" {
+		storage.RevokeSession(h.db, sessionID, "user_logout")
+	}
+
 	if err := storage.LogAuditEvent(h.db, userID, "", "user_logout", map[string]interface{}{
+		"session_id":  sessionID,
 		"ip_address":  c.ClientIP(),
 		"user_agent":  c.GetHeader("User-Agent"),
-		"logout_time": time.Now(),
+		"logout_time": time.Now().Unix(),
+		"result":      "success",
 	}); err != nil {
 		h.logger.Warn("Failed to log audit event", "error", err)
 	}
@@ -217,12 +330,18 @@ func (h *UserHandler) Logout(c *gin.Context) {
 func (h *UserHandler) RefreshToken(c *gin.Context) {
 	userID := c.GetString("user_id")
 	userEmail := c.GetString("user_email")
+	sessionID := c.GetString("session_id")
+	
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": "Authentication required",
 			"code":  "AUTH_REQUIRED",
 		})
 		return
+	}
+
+	if sessionID != "" {
+		storage.UpdateSessionActivity(h.db, sessionID)
 	}
 
 	token, err := utils.GenerateJWT(userID, userEmail, h.config.Security.JWTSecret)
@@ -333,6 +452,15 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 		return
 	}
 
+	if err := storage.LogAuditEvent(h.db, userID, "", "profile_updated", map[string]interface{}{
+		"changes":    map[string]string{"email": req.Email},
+		"ip_address": c.ClientIP(),
+		"user_agent": c.GetHeader("User-Agent"),
+		"result":     "success",
+	}); err != nil {
+		h.logger.Warn("Failed to log audit event", "error", err)
+	}
+
 	h.logger.Info("User profile updated", "user_id", userID)
 
 	c.JSON(http.StatusOK, UserResponse{
@@ -353,10 +481,35 @@ func (h *UserHandler) DeleteAccount(c *gin.Context) {
 		return
 	}
 
+	user, err := storage.GetUserByID(h.db, userID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "User not found",
+			"code":  "USER_NOT_FOUND",
+		})
+		return
+	}
+
+	user.IsActive = false
+	user.UpdatedAt = time.Now()
+	
+	if err := storage.UpdateUser(h.db, user); err != nil {
+		h.logger.Error("Failed to deactivate user", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to delete account",
+			"code":  "DATABASE_ERROR",
+		})
+		return
+	}
+
+	storage.RevokeAllUserSessions(h.db, userID, "account_deleted")
+	h.keyMgr.DeactivateAllUserKeys(userID)
+
 	if err := storage.LogAuditEvent(h.db, userID, "", "account_deleted", map[string]interface{}{
 		"ip_address": c.ClientIP(),
 		"user_agent": c.GetHeader("User-Agent"),
-		"timestamp":  time.Now(),
+		"timestamp":  time.Now().Unix(),
+		"result":     "success",
 	}); err != nil {
 		h.logger.Warn("Failed to log audit event", "error", err)
 	}
@@ -422,20 +575,35 @@ func (h *UserHandler) GetActiveSessions(c *gin.Context) {
 		return
 	}
 
-	sessions := []map[string]interface{}{
-		{
-			"id":           "current",
-			"ip_address":   c.ClientIP(),
-			"user_agent":   c.GetHeader("User-Agent"),
-			"created_at":   time.Now().Unix(),
-			"last_active":  time.Now().Unix(),
-			"is_current":   true,
-		},
+	sessions, err := storage.GetSessionsByUserID(h.db, userID)
+	if err != nil {
+		h.logger.Error("Failed to get user sessions", "user_id", userID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to retrieve sessions",
+			"code":  "DATABASE_ERROR",
+		})
+		return
+	}
+
+	var sessionData []map[string]interface{}
+	currentSessionID := c.GetString("session_id")
+	
+	for _, session := range sessions {
+		sessionInfo := map[string]interface{}{
+			"id":           session.ID,
+			"ip_address":   session.IPAddress,
+			"user_agent":   session.UserAgent,
+			"created_at":   session.CreatedAt.Unix(),
+			"last_active":  session.LastActivity.Unix(),
+			"expires_at":   session.ExpiresAt.Unix(),
+			"is_current":   session.ID == currentSessionID,
+		}
+		sessionData = append(sessionData, sessionInfo)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"sessions": sessions,
-		"count":    len(sessions),
+		"sessions": sessionData,
+		"count":    len(sessionData),
 	})
 }
 
@@ -458,11 +626,21 @@ func (h *UserHandler) RevokeSession(c *gin.Context) {
 		return
 	}
 
+	if err := storage.RevokeSession(h.db, sessionID, "revoked_by_user"); err != nil {
+		h.logger.Error("Failed to revoke session", "session_id", sessionID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to revoke session",
+			"code":  "DATABASE_ERROR",
+		})
+		return
+	}
+
 	if err := storage.LogAuditEvent(h.db, userID, "", "session_revoked", map[string]interface{}{
 		"session_id": sessionID,
 		"ip_address": c.ClientIP(),
 		"user_agent": c.GetHeader("User-Agent"),
-		"timestamp":  time.Now(),
+		"timestamp":  time.Now().Unix(),
+		"result":     "success",
 	}); err != nil {
 		h.logger.Warn("Failed to log audit event", "error", err)
 	}
