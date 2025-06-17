@@ -8,6 +8,9 @@ import (
 	"syscall"
 	"time"
 
+	// Import SQLite driver explicitly - this MUST be first
+	_ "github.com/mattn/go-sqlite3"
+
 	"pqc-authenticator/internal/api"
 	"pqc-authenticator/internal/auth"
 	"pqc-authenticator/internal/storage"

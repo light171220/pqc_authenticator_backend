@@ -7,14 +7,7 @@ import (
 )
 
 var migrations = []string{
-	`
-	PRAGMA foreign_keys = ON;
-	PRAGMA journal_mode = WAL;
-	PRAGMA synchronous = NORMAL;
-	PRAGMA cache_size = -64000;
-	PRAGMA temp_store = memory;
-	PRAGMA mmap_size = 268435456;
-	`,
+	``,
 	`
 	CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
@@ -334,13 +327,24 @@ var migrations = []string{
 }
 
 func RunMigrations(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("migration transaction start failed: %w", err)
+	// First, set SQLite pragmas outside of transaction
+	pragmas := []string{
+		"PRAGMA foreign_keys = ON",
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA synchronous = NORMAL",
+		"PRAGMA cache_size = -64000",
+		"PRAGMA temp_store = memory",
+		"PRAGMA mmap_size = 268435456",
 	}
-	defer tx.Rollback()
 
-	_, err = tx.Exec(`
+	for _, pragma := range pragmas {
+		if _, err := db.Exec(pragma); err != nil {
+			return fmt.Errorf("failed to set pragma: %w", err)
+		}
+	}
+
+	// Create schema_migrations table outside transaction
+	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INTEGER PRIMARY KEY,
 			applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -352,28 +356,36 @@ func RunMigrations(db *sql.DB) error {
 	}
 
 	var lastVersion int
-	err = tx.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&lastVersion)
+	err = db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&lastVersion)
 	if err != nil {
 		return fmt.Errorf("last migration version query failed: %w", err)
 	}
 
 	for i := lastVersion; i < len(migrations); i++ {
+		if migrations[i] == "" {
+			// Skip empty migration
+			_, err = db.Exec("INSERT INTO schema_migrations (version, execution_time_ms) VALUES (?, ?)", i+1, 0)
+			if err != nil {
+				return fmt.Errorf("migration %d recording failed: %w", i+1, err)
+			}
+			continue
+		}
+
 		start := time.Now()
 		
-		if _, err := tx.Exec(migrations[i]); err != nil {
+		// Execute migration outside transaction for SQLite compatibility
+		if _, err := db.Exec(migrations[i]); err != nil {
 			return fmt.Errorf("migration %d execution failed: %w", i+1, err)
 		}
 
 		executionTime := time.Since(start).Milliseconds()
-		_, err = tx.Exec("INSERT INTO schema_migrations (version, execution_time_ms) VALUES (?, ?)", 
+		_, err = db.Exec("INSERT INTO schema_migrations (version, execution_time_ms) VALUES (?, ?)", 
 			i+1, executionTime)
 		if err != nil {
 			return fmt.Errorf("migration %d recording failed: %w", i+1, err)
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("migration transaction commit failed: %w", err)
+		fmt.Printf("Applied migration %d (took %dms)\n", i+1, executionTime)
 	}
 
 	return nil

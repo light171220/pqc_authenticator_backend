@@ -3,7 +3,8 @@ FROM node:18-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --only=production
+# Use npm install --production instead of npm ci for flexibility
+RUN npm install --production
 
 COPY . .
 RUN npm run build

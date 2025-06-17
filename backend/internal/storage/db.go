@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -21,20 +22,13 @@ type Database struct {
 type Config struct {
 	Type           string
 	Path           string
+	URL            string
 	MaxConnections int
 	MaxRetries     int
 	RetryDelay     time.Duration
 }
 
 func DB(config *Config) (*Database, error) {
-	if config.Type != "sqlite" {
-		return nil, fmt.Errorf("unsupported database type: %s", config.Type)
-	}
-
-	if config.Path == "" {
-		return nil, fmt.Errorf("database path cannot be empty")
-	}
-
 	if config.MaxConnections <= 0 {
 		config.MaxConnections = 25
 	}
@@ -47,12 +41,42 @@ func DB(config *Config) (*Database, error) {
 		config.RetryDelay = 5 * time.Second
 	}
 
-	dir := filepath.Dir(config.Path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create database directory: %w", err)
+	var connectionString string
+	var driverName string
+
+	if config.URL != "" {
+		connectionString = config.URL
+		if strings.Contains(connectionString, "postgres://") {
+			config.Type = "postgres"
+			driverName = "postgres"
+		} else {
+			config.Type = "sqlite3"
+			driverName = "sqlite3"
+		}
+	} else {
+		switch config.Type {
+		case "postgres":
+			if config.URL == "" {
+				return nil, fmt.Errorf("postgres URL is required")
+			}
+			connectionString = config.URL
+			driverName = "postgres"
+		case "sqlite", "sqlite3":
+			if config.Path == "" {
+				config.Path = "./data/authenticator.db"
+			}
+			dir := filepath.Dir(config.Path)
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create database directory: %w", err)
+			}
+			connectionString = fmt.Sprintf("%s?_foreign_keys=1&_journal_mode=WAL&_synchronous=NORMAL&_timeout=5000&_busy_timeout=5000", config.Path)
+			driverName = "sqlite3"
+		default:
+			return nil, fmt.Errorf("unsupported database type: %s", config.Type)
+		}
 	}
 
-	db, err := openWithRetry(config)
+	db, err := openWithRetry(driverName, connectionString, config)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +86,7 @@ func DB(config *Config) (*Database, error) {
 	db.SetConnMaxLifetime(time.Hour)
 	db.SetConnMaxIdleTime(30 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
@@ -77,16 +101,16 @@ func DB(config *Config) (*Database, error) {
 	}, nil
 }
 
-func openWithRetry(config *Config) (*sql.DB, error) {
-	connectionString := fmt.Sprintf("%s?_foreign_keys=1&_journal_mode=WAL&_synchronous=NORMAL&_timeout=5000&_busy_timeout=5000", config.Path)
-	
+func openWithRetry(driverName, connectionString string, config *Config) (*sql.DB, error) {
 	var db *sql.DB
 	var err error
 	
 	for i := 0; i < config.MaxRetries; i++ {
-		db, err = sql.Open("sqlite3", connectionString)
+		db, err = sql.Open(driverName, connectionString)
 		if err == nil {
-			break
+			if err = db.Ping(); err == nil {
+				break
+			}
 		}
 		
 		if i < config.MaxRetries-1 {
@@ -203,5 +227,7 @@ func isRetryableError(err error) bool {
 	return strings.Contains(errStr, "database is locked") ||
 		   strings.Contains(errStr, "database is busy") ||
 		   strings.Contains(errStr, "connection reset") ||
-		   strings.Contains(errStr, "broken pipe")
+		   strings.Contains(errStr, "broken pipe") ||
+		   strings.Contains(errStr, "connection refused") ||
+		   strings.Contains(errStr, "timeout")
 }

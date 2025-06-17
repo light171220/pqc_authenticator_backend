@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -42,11 +43,25 @@ type LoginRequest struct {
 	Password string `json:"password" binding:"required"`
 }
 
+type PasswordResetRequest struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
+type PasswordResetConfirmRequest struct {
+	Token       string `json:"token" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required,min=8"`
+}
+
+type ResendVerificationRequest struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
 type UserResponse struct {
 	ID        string    `json:"id"`
 	Username  string    `json:"username"`
 	Email     string    `json:"email"`
 	CreatedAt time.Time `json:"created_at"`
+	EmailVerified bool  `json:"email_verified"`
 }
 
 func (h *UserHandler) Register(c *gin.Context) {
@@ -145,6 +160,10 @@ func (h *UserHandler) Register(c *gin.Context) {
 		return
 	}
 
+	if err := h.SendEmailVerification(user.ID, user.Email); err != nil {
+		h.logger.Warn("Failed to send verification email", "error", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		h.logger.Error("Failed to commit transaction", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -170,6 +189,7 @@ func (h *UserHandler) Register(c *gin.Context) {
 		Username:  user.Username,
 		Email:     user.Email,
 		CreatedAt: user.CreatedAt,
+		EmailVerified: false,
 	})
 }
 
@@ -282,6 +302,13 @@ func (h *UserHandler) Login(c *gin.Context) {
 
 	h.logger.Info("User logged in", "user_id", user.ID, "username", user.Username)
 
+	var emailVerified bool
+	query := `SELECT email_verified FROM users WHERE id = ?`
+	err = h.db.QueryRow(query, user.ID).Scan(&emailVerified)
+	if err != nil {
+		emailVerified = false
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"token": token,
 		"user": UserResponse{
@@ -289,8 +316,191 @@ func (h *UserHandler) Login(c *gin.Context) {
 			Username:  user.Username,
 			Email:     user.Email,
 			CreatedAt: user.CreatedAt,
+			EmailVerified: emailVerified,
 		},
 	})
+}
+
+func (h *UserHandler) RequestPasswordReset(c *gin.Context) {
+	var req PasswordResetRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	user, err := storage.GetUserByEmail(h.db, req.Email)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "If the email exists, a reset link has been sent"})
+		return
+	}
+
+	tokenBytes := make([]byte, 32)
+	rand.Read(tokenBytes)
+	token := hex.EncodeToString(tokenBytes)
+
+	query := `UPDATE users SET password_reset_token = ?, password_reset_expires = ? WHERE id = ?`
+	expiresAt := time.Now().Add(time.Hour)
+	_, err = h.db.Exec(query, token, expiresAt, user.ID)
+	if err != nil {
+		h.logger.Error("Failed to set password reset token", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process request"})
+		return
+	}
+
+	if err := storage.LogAuditEvent(h.db, user.ID, "", "password_reset_requested", map[string]interface{}{
+		"email":      req.Email,
+		"ip_address": c.ClientIP(),
+		"user_agent": c.GetHeader("User-Agent"),
+		"timestamp":  time.Now().Unix(),
+	}); err != nil {
+		h.logger.Warn("Failed to log audit event", "error", err)
+	}
+
+	h.logger.Info("Password reset requested", "user_id", user.ID, "email", req.Email)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Password reset instructions sent",
+		"token":   token,
+	})
+}
+
+func (h *UserHandler) ResetPassword(c *gin.Context) {
+	var req PasswordResetConfirmRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	if !utils.IsStrongPassword(req.NewPassword) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password does not meet security requirements"})
+		return
+	}
+
+	query := `SELECT id, email FROM users WHERE password_reset_token = ? AND password_reset_expires > ? AND is_active = 1`
+	var userID, email string
+	err := h.db.QueryRow(query, req.Token, time.Now()).Scan(&userID, &email)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired token"})
+		return
+	}
+
+	passwordHash, err := utils.HashPassword(req.NewPassword)
+	if err != nil {
+		h.logger.Error("Failed to hash new password", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset password"})
+		return
+	}
+
+	updateQuery := `UPDATE users SET password_hash = ?, password_reset_token = NULL, password_reset_expires = NULL, 
+		failed_login_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?`
+	_, err = h.db.Exec(updateQuery, passwordHash, time.Now(), userID)
+	if err != nil {
+		h.logger.Error("Failed to update password", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset password"})
+		return
+	}
+
+	storage.RevokeAllUserSessions(h.db, userID, "password_reset")
+
+	if err := storage.LogAuditEvent(h.db, userID, "", "password_reset_completed", map[string]interface{}{
+		"email":      email,
+		"ip_address": c.ClientIP(),
+		"user_agent": c.GetHeader("User-Agent"),
+		"timestamp":  time.Now().Unix(),
+	}); err != nil {
+		h.logger.Warn("Failed to log audit event", "error", err)
+	}
+
+	h.logger.Info("Password reset completed", "user_id", userID, "email", email)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully"})
+}
+
+func (h *UserHandler) SendEmailVerification(userID, email string) error {
+	tokenBytes := make([]byte, 32)
+	rand.Read(tokenBytes)
+	token := hex.EncodeToString(tokenBytes)
+
+	query := `UPDATE users SET email_verification_token = ? WHERE id = ?`
+	_, err := h.db.Exec(query, token, userID)
+	if err != nil {
+		return err
+	}
+
+	h.logger.Info("Email verification token generated", "user_id", userID, "token", token)
+	return nil
+}
+
+func (h *UserHandler) VerifyEmail(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Verification token required"})
+		return
+	}
+
+	query := `SELECT id, email FROM users WHERE email_verification_token = ? AND is_active = 1`
+	var userID, email string
+	err := h.db.QueryRow(query, token).Scan(&userID, &email)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid verification token"})
+		return
+	}
+
+	updateQuery := `UPDATE users SET email_verified = 1, email_verification_token = NULL, updated_at = ? WHERE id = ?`
+	_, err = h.db.Exec(updateQuery, time.Now(), userID)
+	if err != nil {
+		h.logger.Error("Failed to verify email", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify email"})
+		return
+	}
+
+	if err := storage.LogAuditEvent(h.db, userID, "", "email_verified", map[string]interface{}{
+		"email":      email,
+		"ip_address": c.ClientIP(),
+		"user_agent": c.GetHeader("User-Agent"),
+		"timestamp":  time.Now().Unix(),
+	}); err != nil {
+		h.logger.Warn("Failed to log audit event", "error", err)
+	}
+
+	h.logger.Info("Email verified", "user_id", userID, "email", email)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Email verified successfully"})
+}
+
+func (h *UserHandler) ResendVerification(c *gin.Context) {
+	var req ResendVerificationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	user, err := storage.GetUserByEmail(h.db, req.Email)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "If the email exists, verification has been resent"})
+		return
+	}
+
+	var emailVerified bool
+	query := `SELECT email_verified FROM users WHERE id = ?`
+	err = h.db.QueryRow(query, user.ID).Scan(&emailVerified)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check verification status"})
+		return
+	}
+
+	if emailVerified {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Email already verified"})
+		return
+	}
+
+	if err := h.SendEmailVerification(user.ID, user.Email); err != nil {
+		h.logger.Error("Failed to send verification email", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send verification"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Verification email sent"})
 }
 
 func (h *UserHandler) Logout(c *gin.Context) {
@@ -380,11 +590,19 @@ func (h *UserHandler) GetProfile(c *gin.Context) {
 		return
 	}
 
+	var emailVerified bool
+	query := `SELECT email_verified FROM users WHERE id = ?`
+	err = h.db.QueryRow(query, userID).Scan(&emailVerified)
+	if err != nil {
+		emailVerified = false
+	}
+
 	c.JSON(http.StatusOK, UserResponse{
 		ID:        user.ID,
 		Username:  user.Username,
 		Email:     user.Email,
 		CreatedAt: user.CreatedAt,
+		EmailVerified: emailVerified,
 	})
 }
 
@@ -439,6 +657,13 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 		}
 
 		user.Email = req.Email
+		
+		emailVerifiedQuery := `UPDATE users SET email_verified = 0 WHERE id = ?`
+		h.db.Exec(emailVerifiedQuery, userID)
+		
+		if err := h.SendEmailVerification(userID, req.Email); err != nil {
+			h.logger.Warn("Failed to send verification email", "error", err)
+		}
 	}
 
 	user.UpdatedAt = time.Now()
@@ -463,11 +688,19 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 
 	h.logger.Info("User profile updated", "user_id", userID)
 
+	var emailVerified bool
+	query := `SELECT email_verified FROM users WHERE id = ?`
+	err = h.db.QueryRow(query, userID).Scan(&emailVerified)
+	if err != nil {
+		emailVerified = false
+	}
+
 	c.JSON(http.StatusOK, UserResponse{
 		ID:        user.ID,
 		Username:  user.Username,
 		Email:     user.Email,
 		CreatedAt: user.CreatedAt,
+		EmailVerified: emailVerified,
 	})
 }
 

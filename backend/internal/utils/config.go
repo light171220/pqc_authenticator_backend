@@ -34,6 +34,7 @@ type ServerConfig struct {
 type DatabaseConfig struct {
 	Type           string        `yaml:"type"`
 	Path           string        `yaml:"path"`
+	URL            string        `yaml:"url"`
 	MaxConnections int           `yaml:"max_connections"`
 	MaxRetries     int           `yaml:"max_retries"`
 	RetryDelay     time.Duration `yaml:"retry_delay"`
@@ -120,8 +121,9 @@ func getDefaultConfig() *Config {
 			MaxHeaderBytes: 1 << 20,
 		},
 		Database: DatabaseConfig{
-			Type:           "sqlite",
-			Path:           getEnvOrDefault("DATABASE_PATH", "/var/lib/pqc-authenticator/data/authenticator.db"),
+			Type:           getEnvOrDefault("DATABASE_TYPE", "sqlite"),
+			Path:           getEnvOrDefault("DATABASE_PATH", "/app/data/authenticator.db"),
+			URL:            getEnvOrDefault("DATABASE_URL", ""),
 			MaxConnections: getEnvIntOrDefault("DATABASE_MAX_CONNECTIONS", 50),
 			MaxRetries:     5,
 			RetryDelay:     2 * time.Second,
@@ -155,7 +157,7 @@ func getDefaultConfig() *Config {
 		Logging: LoggingConfig{
 			Level:       getEnvOrDefault("LOG_LEVEL", "info"),
 			Format:      "json",
-			Output:      getEnvOrDefault("LOG_OUTPUT", "/var/log/pqc-authenticator/app.log"),
+			Output:      getEnvOrDefault("LOG_OUTPUT", "stdout"),
 			AuditLevel:  "info",
 			MaxFileSize: "500MB",
 		},
@@ -199,8 +201,17 @@ func overrideWithEnvVars(config *Config) {
 	if val := os.Getenv("SERVER_MODE"); val != "" && (val == "debug" || val == "release") {
 		config.Server.Mode = val
 	}
+	if val := os.Getenv("DATABASE_URL"); val != "" {
+		config.Database.URL = val
+		if strings.Contains(val, "postgres://") {
+			config.Database.Type = "postgres"
+		}
+	}
 	if val := os.Getenv("DATABASE_PATH"); val != "" {
 		config.Database.Path = val
+	}
+	if val := os.Getenv("DATABASE_TYPE"); val != "" {
+		config.Database.Type = val
 	}
 	if val := os.Getenv("DATABASE_MAX_CONNECTIONS"); val != "" {
 		if maxConns, err := strconv.Atoi(val); err == nil && maxConns > 0 {
@@ -265,8 +276,16 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("invalid server mode: %s", config.Server.Mode)
 	}
 
-	if config.Database.Path == "" {
-		return fmt.Errorf("database path cannot be empty")
+	if config.Database.Type != "sqlite" && config.Database.Type != "postgres" {
+		return fmt.Errorf("invalid database type: %s", config.Database.Type)
+	}
+
+	if config.Database.Type == "sqlite" && config.Database.Path == "" && config.Database.URL == "" {
+		return fmt.Errorf("database path cannot be empty for SQLite")
+	}
+
+	if config.Database.Type == "postgres" && config.Database.URL == "" {
+		return fmt.Errorf("database URL cannot be empty for PostgreSQL")
 	}
 
 	if config.Database.MaxConnections <= 0 {
